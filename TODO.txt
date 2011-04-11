@@ -1,0 +1,6 @@
+TODO List
+=========
+
+* Add API tests to validate that both Win and Linux impls behave correctly 9i.e. the same)
+
+* Add windows implementation for ev_idle and ev_async
