@@ -32,12 +32,12 @@ int oio_close_error(oio_handle* handle, oio_err err);
 
 
 static oio_err oio_err_new(oio_handle* handle, int e) {
-  handle->_.err = e;
+  handle->err = e;
   return e;
 }
 
 oio_err oio_err_last(oio_handle *handle) {
-  return handle->_.err;
+  return handle->err;
 }
 
 
@@ -67,33 +67,28 @@ int oio_run() {
 }
 
 
-oio_handle* oio_tcp_handle_new(oio_close_cb close_cb, void* data) {
-  oio_handle *handle = calloc(sizeof(oio_handle), 1);
-  if (!handle) {
-    oio_err_new(NULL, ENOMEM);
-    return NULL;
-  }
-
+int oio_tcp_handle_init(oio_handle *handle, oio_close_cb close_cb,
+    void* data) {
   handle->type = OIO_TCP;
   handle->close_cb = close_cb;
   handle->data = data;
+  handle->accepted_fd = -1;
+
+  ngx_queue_init(&handle->read_reqs);
 
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
     oio_err_new(handle, errno);
-    free(handle);
-    return NULL;
+    return -1;
   }
 
   if (oio_tcp_open(handle, fd)) {
     close(fd);
-    free(handle);
-    return NULL;
+    return -2;
   }
 
-  return handle;
+  return 0;
 }
-
 
 
 int oio_bind(oio_handle* handle, struct sockaddr* addr) {
@@ -101,7 +96,7 @@ int oio_bind(oio_handle* handle, struct sockaddr* addr) {
   int domain;
   int r;
 
-  assert(handle->_.fd >= 0);
+  assert(handle->fd >= 0);
 
   if (addr->sa_family == AF_INET) {
     addrsize = sizeof(struct sockaddr_in);
@@ -114,7 +109,7 @@ int oio_bind(oio_handle* handle, struct sockaddr* addr) {
     return -1;
   }
 
-  r = bind(handle->_.fd, addr, addrsize);
+  r = bind(handle->fd, addr, addrsize);
 
   return oio_err_new(handle, r);
 }
@@ -135,15 +130,15 @@ int oio_tcp_open(oio_handle* handle, int fd) {
   /* Set non-blocking, etc */
   oio_tcp_init_fd(fd);
 
-  handle->_.fd = fd;
+  handle->fd = fd;
 
-  ngx_queue_init(&handle->_.read_reqs);
+  ngx_queue_init(&handle->read_reqs);
 
-  ev_io_init(&handle->_.read_watcher, oio_tcp_io, fd, EV_READ);
-  ev_io_init(&handle->_.write_watcher, oio_tcp_io, fd, EV_WRITE);
+  ev_io_init(&handle->read_watcher, oio_tcp_io, fd, EV_READ);
+  ev_io_init(&handle->write_watcher, oio_tcp_io, fd, EV_WRITE);
 
-  handle->_.read_watcher.data = handle;
-  handle->_.write_watcher.data = handle;
+  handle->read_watcher.data = handle;
+  handle->write_watcher.data = handle;
 
   return 0;
 }
@@ -154,14 +149,22 @@ void oio_server_io(EV_P_ ev_io* watcher, int revents) {
 
   assert(revents == EV_READ);
 
+  if (handle->accepted_fd >= 0) {
+    ev_io_stop(EV_DEFAULT_ &handle->read_watcher);
+    return;
+  }
+
   while (1) {
     struct sockaddr addr;
     socklen_t addrlen;
-    int fd = accept(handle->_.fd, &addr, &addrlen);
+
+    assert(handle->accepted_fd < 0);
+    int fd = accept(handle->fd, &addr, &addrlen);
 
     if (fd < 0) {
       if (errno == EAGAIN) {
-        return; /* No problem. */
+        /* No problem. */
+        return;
       } else if (errno == EMFILE) {
         /* TODO special trick. unlock reserved socket, accept, close. */
         return;
@@ -173,16 +176,12 @@ void oio_server_io(EV_P_ ev_io* watcher, int revents) {
       if (!handle->accept_cb) {
         close(fd);
       } else {
-        oio_handle* new_client = oio_tcp_handle_new(NULL, NULL);
-        if (!new_client) {
-          /* Ignore error for now */
-        } else {
-          if (oio_tcp_open(new_client, fd)) {
-            /* Ignore error for now */
-          } else {
-            ev_io_start(EV_DEFAULT_ &handle->_.read_watcher);
-            handle->accept_cb(handle, new_client);
-          }
+        handle->accepted_fd = fd;
+        handle->accept_cb(handle);
+        if (handle->accepted_fd >= 0) {
+          /* The user hasn't yet accepted called oio_tcp_handle_accept() */
+          ev_io_stop(EV_DEFAULT_ &handle->read_watcher);
+          return;
         }
       }
     }
@@ -190,27 +189,46 @@ void oio_server_io(EV_P_ ev_io* watcher, int revents) {
 }
 
 
-int oio_listen(oio_handle* handle, int backlog, oio_accept_cb cb) {
-  assert(handle->_.fd >= 0);
+int oio_tcp_handle_accept(oio_handle* server, oio_handle* client,
+    oio_close_cb close_cb, void* data) {
+  if (server->accepted_fd < 0) {
+    return -1;
+  }
 
-  int r = listen(handle->_.fd, backlog);
+  if (oio_tcp_open(client, server->accepted_fd)) {
+    /* Ignore error for now */
+    server->accepted_fd = -1;
+    close(server->accepted_fd);
+    return -1;
+  } else {
+    server->accepted_fd = -1;
+    ev_io_start(EV_DEFAULT_ &server->read_watcher);
+    return 0;
+  }
+}
+
+
+int oio_listen(oio_handle* handle, int backlog, oio_accept_cb cb) {
+  assert(handle->fd >= 0);
+
+  int r = listen(handle->fd, backlog);
   if (r < 0) {
     return oio_err_new(handle, errno);
   }
 
   handle->accept_cb = cb;
-  ev_io_init(&handle->_.read_watcher, oio_server_io, handle->_.fd, EV_READ);
-  ev_io_start(EV_DEFAULT_ &handle->_.read_watcher);
-  handle->_.read_watcher.data = handle;
+  ev_io_init(&handle->read_watcher, oio_server_io, handle->fd, EV_READ);
+  ev_io_start(EV_DEFAULT_ &handle->read_watcher);
+  handle->read_watcher.data = handle;
 
   return 0;
 }
 
 
 int oio_close_error(oio_handle* handle, oio_err err) {
-  ev_io_stop(EV_DEFAULT_ &handle->_.read_watcher);
-  close(handle->_.fd);
-  handle->_.fd = -1;
+  ev_io_stop(EV_DEFAULT_ &handle->read_watcher);
+  close(handle->fd);
+  handle->fd = -1;
 
   if (handle->close_cb) {
     handle->close_cb(handle, err);
@@ -221,54 +239,52 @@ int oio_close_error(oio_handle* handle, oio_err err) {
 
 
 oio_req* oio_read_reqs_head(oio_handle* handle) {
-  ngx_queue_t* q = ngx_queue_head(&(handle->_.read_reqs));
+  ngx_queue_t* q = ngx_queue_head(&(handle->read_reqs));
   if (!q) {
     return NULL;
   }
 
-  oio_req_private* p = ngx_queue_data(q, oio_req_private, read_reqs);
-  assert(p);
-  int off =  offsetof(oio_req, _);
-  oio_req* req = (oio_req*)  ((char*)p - off);
+  oio_req* req = ngx_queue_data(q, struct oio_req_s, read_reqs);
+  assert(req);
 
   return req;
 }
 
 
 int oio_read_reqs_empty(oio_handle* handle) {
-  return ngx_queue_empty(&(handle->_.read_reqs));
+  return ngx_queue_empty(&(handle->read_reqs));
 }
 
 
 void oio__read(oio_handle* handle) {
-  assert(handle->_.fd >= 0);
+  assert(handle->fd >= 0);
 
   /* Get the request at the head of the read_reqs queue. */
   oio_req* req = oio_read_reqs_head(handle);
   if (!req) {
-    ev_io_stop(EV_DEFAULT_ &(handle->_.read_watcher));
+    ev_io_stop(EV_DEFAULT_ &(handle->read_watcher));
     return;
   }
 
   /* Cast to iovec. We had to have our own oio_buf instead of iovec
    * because Windows's WSABUF is not an iovec.
    */
-  struct iovec* iov = (struct iovec*) req->_.read_bufs;
-  int iovcnt = req->_.read_bufcnt;
+  struct iovec* iov = (struct iovec*) req->read_bufs;
+  int iovcnt = req->read_bufcnt;
 
   assert(iov);
   assert(iovcnt > 0);
 
   /* Now do the actual read. */
 
-  ssize_t nread = readv(handle->_.fd, iov, iovcnt);
+  ssize_t nread = readv(handle->fd, iov, iovcnt);
 
   oio_read_cb cb = req->cb;
 
   if (nread < 0) {
     if (errno == EAGAIN) {
       /* Just wait for the next one. */
-      assert(ev_is_active(&(handle->_.read_watcher)));
+      assert(ev_is_active(&(handle->read_watcher)));
     } else {
       oio_err err = oio_err_new(handle, errno);
       if (cb) {
@@ -279,15 +295,11 @@ void oio__read(oio_handle* handle) {
   } else {
     /* Successful read */
 
-    /* First pop the req off handle->_.read_reqs */
-    ngx_queue_remove(&(req->_.read_reqs));
+    /* First pop the req off handle->read_reqs */
+    ngx_queue_remove(&(req->read_reqs));
 
-    /* Must free req if local. Also must free req->_.read_bufs. */
-    free(req->_.read_bufs);
-    req->_.read_bufs = NULL;
-    if (req->_.local) {
-      free(req);
-    }
+    free(req->read_bufs);
+    req->read_bufs = NULL;
 
     /* NOTE: call callback AFTER freeing the request data. */
     if (cb) {
@@ -295,7 +307,7 @@ void oio__read(oio_handle* handle) {
     }
 
     if (oio_read_reqs_empty(handle)) {
-      ev_io_stop(EV_DEFAULT_ &(handle->_.read_watcher));
+      ev_io_stop(EV_DEFAULT_ &(handle->read_watcher));
     }
   }
 }
@@ -304,10 +316,10 @@ void oio__read(oio_handle* handle) {
 void oio_tcp_io(EV_P_ ev_io* watcher, int revents) {
   oio_handle* handle = watcher->data;
 
-  assert(handle->_.fd >= 0);
+  assert(handle->fd >= 0);
 
-  if (handle->_.connect_req) {
-    oio_tcp_connect(handle, handle->_.connect_req);
+  if (handle->connect_req) {
+    oio_tcp_connect(handle, handle->connect_req);
   } else {
     if (revents & EV_READ) {
       oio__read(handle);
@@ -326,30 +338,21 @@ void oio_tcp_io(EV_P_ ev_io* watcher, int revents) {
  * getsockopt.
  */
 void oio_tcp_connect(oio_handle* handle, oio_req* req) {
-  assert(handle->_.fd >= 0);
+  assert(handle->fd >= 0);
   assert(req);
 
   int error;
   int errorsize = sizeof(int);
-  getsockopt(handle->_.fd, SOL_SOCKET, SO_ERROR, &error, &errorsize);
+  getsockopt(handle->fd, SOL_SOCKET, SO_ERROR, &error, &errorsize);
 
   if (!error) {
-    ev_io_init(&handle->_.write_watcher, oio_tcp_io, handle->_.fd, EV_WRITE);
-    ev_set_cb(&handle->_.read_watcher, oio_tcp_io);
+    ev_io_init(&handle->write_watcher, oio_tcp_io, handle->fd, EV_WRITE);
+    ev_set_cb(&handle->read_watcher, oio_tcp_io);
 
     /* Successful connection */
     oio_connect_cb connect_cb = req->cb;
     if (connect_cb) {
-      if (req->_.local) {
-        connect_cb(NULL, oio_err_new(handle, 0));
-      } else {
-        connect_cb(req, oio_err_new(handle, 0));
-      }
-    }
-
-    /* Free up connect_req if we own it. */
-    if (req->_.local) {
-      free(req);
+      connect_cb(req, oio_err_new(handle, 0));
     }
 
     req = NULL;
@@ -361,8 +364,8 @@ void oio_tcp_connect(oio_handle* handle, oio_req* req) {
   } else {
     oio_err err = oio_err_new(handle, error);
 
-    if (req->_.connect_cb) {
-      req->_.connect_cb(req, err);
+    if (req->connect_cb) {
+      req->connect_cb(req, err);
     }
 
     oio_close_error(handle, err);
@@ -370,25 +373,13 @@ void oio_tcp_connect(oio_handle* handle, oio_req* req) {
 }
 
 
-oio_req* oio_req_maybe_alloc(oio_handle* handle, oio_req* in_req) {
-  if (in_req) {
-    ngx_queue_init(&(in_req->_.read_reqs));
-    in_req->handle = handle;
-    in_req->_.local = 0;
-    return in_req;
-  } else {
-    oio_req *req = malloc(sizeof(oio_req));
-    oio_req_init(req, NULL);
-    req->handle = handle;
-    ngx_queue_init(&(req->_.read_reqs));
-    req->_.local = 1;
-    return req;
-  }
-}
+int oio_connect(oio_req *req, struct sockaddr* addr) {
+  oio_handle* handle = req->handle;
 
+  req->type = OIO_CONNECT;
+  ngx_queue_init(&(req->read_reqs));
 
-int oio_connect(oio_handle* handle, oio_req *req_in, struct sockaddr* addr) {
-  if (handle->_.connect_req) {
+  if (handle->connect_req) {
     return oio_err_new(handle, EALREADY);
   }
 
@@ -396,47 +387,45 @@ int oio_connect(oio_handle* handle, oio_req *req_in, struct sockaddr* addr) {
     return oio_err_new(handle, ENOTSOCK);
   }
 
-  oio_req *req = oio_req_maybe_alloc(handle, req_in);
-  if (!req) {
-    return oio_err_new(handle, ENOMEM);
-  }
-
-  handle->_.connect_req = req;
-
+  handle->connect_req = req;
 
   int addrsize;
 
   if (addr->sa_family == AF_INET) {
     addrsize = sizeof(struct sockaddr_in);
-    handle->_.fd = socket(AF_INET, SOCK_STREAM, 0);
+    handle->fd = socket(AF_INET, SOCK_STREAM, 0);
   } else if (addr->sa_family == AF_INET6) {
     addrsize = sizeof(struct sockaddr_in6);
-    handle->_.fd = socket(AF_INET6, SOCK_STREAM, 0);
+    handle->fd = socket(AF_INET6, SOCK_STREAM, 0);
   } else {
     assert(0);
     return -1;
   }
 
   /* socket(2) failed */
-  if (handle->_.fd < 0) {
+  if (handle->fd < 0) {
     return oio_err_new(handle, errno);
   }
 
-  int r = connect(handle->_.fd, addr, addrsize);
+  int r = connect(handle->fd, addr, addrsize);
 
-  ev_io_init(&handle->_.read_watcher, oio_tcp_io, handle->_.fd, EV_READ);
-  ev_io_init(&handle->_.write_watcher, oio_tcp_io, handle->_.fd, EV_WRITE);
-  ev_io_start(EV_DEFAULT_ &handle->_.read_watcher);
+  ev_io_init(&(handle->read_watcher), oio_tcp_io, handle->fd, EV_READ);
+  ev_io_init(&(handle->write_watcher), oio_tcp_io, handle->fd, EV_WRITE);
+  ev_io_start(EV_DEFAULT_ &(handle->read_watcher));
 
   return oio_err_new(handle, r);
 }
 
 
-int oio_write(oio_handle* handle, oio_req *req, oio_buf* bufs, int bufcnt) {
-  assert(handle->_.fd >= 0);
+int oio_write(oio_req *req, oio_buf* bufs, int bufcnt) {
+  oio_handle* handle = req->handle;
+  assert(handle->fd >= 0);
   ssize_t r;
 
-  r = writev(handle->_.fd, (struct iovec*)bufs, bufcnt);
+  ngx_queue_init(&(req->read_reqs));
+  req->type = OIO_WRITE;
+
+  r = writev(handle->fd, (struct iovec*)bufs, bufcnt);
 
   if (r < 0) {
     return oio_err_new(handle, r);
@@ -450,33 +439,37 @@ int oio_write(oio_handle* handle, oio_req *req, oio_buf* bufs, int bufcnt) {
 }
 
 
-int oio_write2(oio_handle* handle, const char* msg) {
+int oio_write2(oio_req* req, const char* msg) {
   size_t len = strnlen(msg, 1024 * 1024);
   oio_buf b;
   b.base = (char*)msg;
   b.len = len;
-  return oio_write(handle, NULL, &b, 1);
+  return oio_write(req, &b, 1);
 }
 
 
-int oio_read(oio_handle* handle, oio_req *req_in, oio_buf* bufs, int bufcnt) {
+int oio_read(oio_req *req, oio_buf* bufs, int bufcnt) {
+  oio_handle* handle = req->handle;
   ssize_t nread = -1;
   errno = EAGAIN;
-  oio_read_cb cb = req_in->cb;
+  oio_read_cb cb = req->cb;
 
-  assert(handle->_.fd >= 0);
+  assert(handle->fd >= 0);
 
-  if (ngx_queue_empty(&handle->_.read_reqs)) {
+  if (ngx_queue_empty(&handle->read_reqs)) {
     /* Attempt to read immediately. */
-    ssize_t nread = readv(handle->_.fd, (struct iovec*) bufs, bufcnt);
+    ssize_t nread = readv(handle->fd, (struct iovec*) bufs, bufcnt);
   }
+
+  req->type = OIO_READ;
+  ngx_queue_init(&(req->read_reqs));
 
   if (nread < 0 && errno != EAGAIN) {
     /* Real error. */
     oio_err err = oio_err_new(handle, errno);
 
     if (cb) {
-      cb(req_in, nread);
+      cb(req, nread);
     }
 
     return err;
@@ -485,42 +478,38 @@ int oio_read(oio_handle* handle, oio_req *req_in, oio_buf* bufs, int bufcnt) {
   if (nread >= 0) {
     /* Successful read. */
     if (cb) {
-      cb(req_in, nread);
+      cb(req, nread);
     }
     return 0;
   }
 
   /* Either we never read anything, or we got EAGAIN. */
-  assert(!ngx_queue_empty(&handle->_.read_reqs) ||
+  assert(!ngx_queue_empty(&handle->read_reqs) ||
          (nread < 0 && errno == EAGAIN));
 
   /* Two possible states:
    * - EAGAIN, meaning the socket is not wriable currently. We must wait for
-   *   it to become readable with the handle->_.read_watcher.
+   *   it to become readable with the handle->read_watcher.
    * - The read_reqs queue already has reads. Meaning: the user has issued
    *   many oio_reads calls some of which are still waiting for the socket to
    *   become readable.
-   * In the meantime we append the request to handle->_.read_reqs
+   * In the meantime we append the request to handle->read_reqs
    */
-  oio_req* req = oio_req_maybe_alloc(handle, req_in);
-  if (!req) {
-    return oio_err_new(handle, ENOMEM);
-  }
 
   /* Copy the bufs data over into our oio_req struct. This is so the user can
    * free the oio_buf array. The actual data inside the oio_bufs is however
    * owned by the user and cannot be deallocated until the read completes.
    */
-  req->_.read_bufs = malloc(sizeof(oio_buf) * bufcnt);
-  memcpy(req->_.read_bufs, bufs, bufcnt * sizeof(oio_buf));
-  req->_.read_bufcnt = bufcnt;
+  req->read_bufs = malloc(sizeof(oio_buf) * bufcnt);
+  memcpy(req->read_bufs, bufs, bufcnt * sizeof(oio_buf));
+  req->read_bufcnt = bufcnt;
 
   /* Append the request to read_reqs. */
-  ngx_queue_insert_tail(&(handle->_.read_reqs), &(req->_.read_reqs));
+  ngx_queue_insert_tail(&(handle->read_reqs), &(req->read_reqs));
 
-  ev_io_start(EV_DEFAULT_ &handle->_.read_watcher);
+  ev_io_start(EV_DEFAULT_ &handle->read_watcher);
 
-  return oio_err_new(handle, EINPROGRESS);
+  return 0;
 }
 
 
@@ -531,8 +520,9 @@ void oio_free(oio_handle* handle) {
 }
 
 
-void oio_req_init(oio_req *req, void *cb) {
+void oio_req_init(oio_req* req, oio_handle* handle, void* cb) {
   req->type = OIO_UNKNOWN_REQ;
   req->cb = cb;
-  ngx_queue_init(&(req->_.read_reqs));
+  req->handle = handle;
+  ngx_queue_init(&(req->read_reqs));
 }

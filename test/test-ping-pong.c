@@ -1,6 +1,5 @@
 #include "../oio.h"
 #include "test.h"
-#include <assert.h>
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -30,8 +29,8 @@ void pinger_try_read(pinger_t* pinger);
 void pinger_on_close(oio_handle* handle, oio_err err) {
   pinger_t* pinger = (pinger_t*)handle->data;
 
-  assert(!err);
-  assert(NUM_PINGS == pinger->pongs);
+  ASSERT(!err)
+  ASSERT(NUM_PINGS == pinger->pongs)
 
   free(pinger);
 
@@ -46,12 +45,12 @@ void pinger_after_write(oio_req *req) {
 
 void pinger_write_ping(pinger_t* pinger) {
   oio_req *req;
-  int r;
-
+  
   req = (oio_req*)malloc(sizeof(*req));
   oio_req_init(req, &pinger->handle, pinger_after_write);
-  r = oio_write2(req, (char*)&PING);
-  assert(!r);
+
+  if (oio_write2(req, (char*)&PING))
+    FATAL(oio_write2 failed)
 }
 
 void pinger_after_read(oio_req* req, size_t nread) {
@@ -67,7 +66,7 @@ void pinger_after_read(oio_req* req, size_t nread) {
 
   /* Now we count the pings */
   for (i = 0; i < nread; i++) {
-    assert(pinger->buf.base[i] == PING[pinger->state]);
+    ASSERT(pinger->buf.base[i] == PING[pinger->state])
     pinger->state = (pinger->state + 1) % (sizeof(PING) - 1);
     if (pinger->state == 0) {
       pinger->pongs++;
@@ -92,18 +91,16 @@ void pinger_try_read(pinger_t* pinger) {
 void pinger_on_connect(oio_req *req, oio_err err) {
   pinger_t *pinger = (pinger_t*)req->handle->data;
 
-  if (err) {
-    assert(0);
-  }
+  ASSERT(!err)
 
   pinger_try_read(pinger);
   pinger_write_ping(pinger);
 }
 
 
-int pinger_new(int port) {
+int pinger_new() {
   struct sockaddr_in client_addr = oio_ip4_addr("0.0.0.0", 0);
-  struct sockaddr_in server_addr = oio_ip4_addr("145.94.50.9", TEST_PORT);
+  struct sockaddr_in server_addr = oio_ip4_addr("127.0.0.1", TEST_PORT);
   pinger_t *pinger;
 
   pinger = (pinger_t*)malloc(sizeof(*pinger));
@@ -130,13 +127,13 @@ int pinger_new(int port) {
 TEST_IMPL(ping_pong) {
   oio_init();
 
-  if (pinger_new(8000)) {
+  if (pinger_new()) {
     return 2;
   }
 
   oio_run();
 
-  assert(completed_pingers == 1);
+  ASSERT(completed_pingers == 1)
 
   return 0;
 }

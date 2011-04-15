@@ -1,6 +1,7 @@
 #ifndef OIO_H
 #define OIO_H
 
+#include <stdint.h> /* int64_t */
 #include <stddef.h> /* size_t */
 
 
@@ -9,12 +10,14 @@ typedef int oio_err; /* FIXME */
 typedef struct oio_req_s oio_req;
 typedef struct oio_handle_s oio_handle;
 
+/* TODO: tell the callback if the request was completed or cancelled */
 typedef void (*oio_read_cb)(oio_req* req, size_t nread);
 typedef void (*oio_write_cb)(oio_req* req);
 typedef void (*oio_accept_cb)(oio_handle* handle);
 typedef void (*oio_close_cb)(oio_handle* handle, oio_err e);
 typedef void (*oio_connect_cb)(oio_req* req, oio_err e);
 typedef void (*oio_shutdown_cb)(oio_req* req);
+typedef void (*oio_timer_cb)(oio_req* req, int64_t skew);
 
 
 #if defined(__unix__) || defined(__POSIX__) || defined(__APPLE__)
@@ -39,7 +42,8 @@ typedef enum {
   OIO_READ,
   OIO_WRITE,
   OIO_SHUTDOWN,
-  OIO_CLOSE
+  OIO_CLOSE,
+  OIO_TIMEOUT
 } oio_req_type;
 
 
@@ -50,10 +54,10 @@ struct oio_handle_s {
   oio_close_cb close_cb;
   void* data;
   /* private */
-  struct oio_handle_private_s;
+  oio_handle_private_fields
 };
 
-typedef struct oio_req_s {
+struct oio_req_s {
   /* read-only */
   oio_req_type type;
   /* public */
@@ -61,8 +65,8 @@ typedef struct oio_req_s {
   void* cb;
   void* data;
   /* private */
-  struct oio_req_private_s;
-} oio_req;
+  oio_req_private_fields
+};
 
 
 /**
@@ -76,6 +80,9 @@ const char* oio_err_str(oio_err err);
 
 void oio_init();
 int oio_run();
+
+void oio_update_time();
+int64_t oio_now();
 
 void oio_req_init(oio_req* req, oio_handle* handle, void* cb);
 
@@ -96,12 +103,16 @@ int oio_shutdown(oio_req* req);
 
 /* TCP server methods. */
 int oio_listen(oio_handle* handle, int backlog, oio_accept_cb cb);
-int oio_tcp_handle_accept(oio_handle* server, oio_handle* client, oio_close_cb close_cb, void* data);
+int oio_tcp_handle_accept(oio_handle* server, oio_handle* client,
+                          oio_close_cb close_cb, void* data);
 
 /* Generic handle methods */
 int oio_read(oio_req* req, oio_buf* bufs, int bufcnt);
 int oio_write(oio_req* req, oio_buf* bufs, int bufcnt);
 int oio_write2(oio_req *req, const char* msg);
+
+/* Timer methods */
+int oio_timeout(oio_req *req, int64_t timeout);
 
 /* Request handle to be closed. close_cb will be called */
 /* asynchronously after this call. */

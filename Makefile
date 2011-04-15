@@ -1,4 +1,13 @@
-all: test/echo-demo test/test-ping-pong
+all: oio.a
+
+TESTS=test/echo-server.c \
+			test/test-pass-always.c \
+			test/test-fail-always.c \
+			test/test-ping-pong.c \
+			test/test-callback-stack.c
+
+test/test-runner: test/*.h test/test-runner.c test/test-runner-unix.c $(TESTS) oio.a
+	$(CC) -ansi -g -lm -o test/test-runner  test/test-runner.c test/test-runner-unix.c $(TESTS) oio.a
 
 test/echo-demo: test/echo-demo.c test/echo.o oio.a
 	$(CC) -ansi -g -o test/echo-demo test/echo-demo.c test/echo.o oio.a -lm
@@ -22,10 +31,13 @@ ev/config.h:
 	cd ev && ./configure
 
 
-.PHONY: clean distclean
+.PHONY: clean distclean test
+
+test: test/test-runner
+	test/test-runner
 
 clean:
-	$(RM) -f *.o *.a
+	$(RM) -f *.o *.a test/test-runner
 	$(MAKE) -C ev clean
 
 distclean:
