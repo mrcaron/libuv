@@ -26,14 +26,8 @@
 #include <stdio.h>
 #include <string.h> /* strlen */
 
-static int completed_pingers = 0;
-
-#define NUM_PINGS 1000
-
-/* 64 bytes is enough for a pinger */
-#define BUFSIZE 10240
-
-static char PING[] = "PING\n";
+/* Run the benchmark for this many ms */
+#define TIME 5000
 
 
 typedef struct {
@@ -41,18 +35,56 @@ typedef struct {
   int state;
   uv_handle_t handle;
   uv_req_t connect_req;
-  uv_req_t read_req;
-  char read_buffer[BUFSIZE];
+  uv_req_t shutdown_req;
 } pinger_t;
 
-void pinger_try_read(pinger_t* pinger);
+typedef struct buf_s {
+  uv_buf_t uv_buf_t;
+  struct buf_s* next;
+} buf_t;
 
 
-static void pinger_on_close(uv_handle_t* handle, int status) {
-  pinger_t* pinger = (pinger_t*)handle->data;
+static char PING[] = "PING\n";
+
+static buf_t* buf_freelist = NULL;
+
+static int completed_pingers = 0;
+static int64_t start_time;
+
+
+static uv_buf_t buf_alloc(uv_handle_t* handle, size_t size) {
+  buf_t* ab;
+
+  ab = buf_freelist;
+
+  if (ab != NULL) {
+    buf_freelist = ab->next;
+    return ab->uv_buf_t;
+  }
+
+  ab = (buf_t*) malloc(size + sizeof *ab);
+  ab->uv_buf_t.len = size;
+  ab->uv_buf_t.base = ((char*) ab) + sizeof *ab;
+
+  return ab->uv_buf_t;
+}
+
+
+static void buf_free(uv_buf_t uv_buf_t) {
+  buf_t* ab = (buf_t*) (uv_buf_t.base - sizeof *ab);
+
+  ab->next = buf_freelist;
+  buf_freelist = ab;
+}
+
+
+static void pinger_close_cb(uv_handle_t* handle, int status) {
+  pinger_t* pinger;
 
   ASSERT(status == 0);
-  ASSERT(NUM_PINGS == pinger->pongs);
+
+  pinger = (pinger_t*)handle->data;
+  LOGF("ping_pongs: %d roundtrips/s\n", (1000 * pinger->pongs) / TIME);
 
   free(pinger);
 
@@ -60,7 +92,7 @@ static void pinger_on_close(uv_handle_t* handle, int status) {
 }
 
 
-static void pinger_after_write(uv_req_t *req, int status) {
+static void pinger_write_cb(uv_req_t *req, int status) {
   ASSERT(status == 0);
 
   free(req);
@@ -75,13 +107,16 @@ static void pinger_write_ping(pinger_t* pinger) {
   buf.len = strlen(PING);
 
   req = (uv_req_t*)malloc(sizeof(*req));
-  uv_req_init(req, &pinger->handle, pinger_after_write);
+  uv_req_init(req, &pinger->handle, pinger_write_cb);
 
   if (uv_write(req, &buf, 1)) {
     FATAL("uv_write failed");
   }
+}
 
-  puts("PING");
+
+static void pinger_shutdown_cb(uv_handle_t* handle, int status) {
+  ASSERT(status == 0);
 }
 
 
@@ -94,13 +129,9 @@ static void pinger_read_cb(uv_handle_t* handle, int nread, uv_buf_t buf) {
   if (nread < 0) {
     ASSERT(uv_last_error().code == UV_EOF);
 
-    puts("got EOF");
-
     if (buf.base) {
-      free(buf.base);
+      buf_free(buf);
     }
-
-    uv_close(&pinger->handle);
 
     return;
   }
@@ -110,32 +141,38 @@ static void pinger_read_cb(uv_handle_t* handle, int nread, uv_buf_t buf) {
     ASSERT(buf.base[i] == PING[pinger->state]);
     pinger->state = (pinger->state + 1) % (sizeof(PING) - 1);
     if (pinger->state == 0) {
-      printf("PONG %d\n", pinger->pongs);
       pinger->pongs++;
-      if (pinger->pongs < NUM_PINGS) {
-        pinger_write_ping(pinger);
-      } else {
-        uv_close(&pinger->handle);
+      if (uv_now() - start_time > TIME) {
+        uv_req_init(&pinger->shutdown_req, handle, pinger_shutdown_cb);
+        uv_shutdown(&pinger->shutdown_req);
+        break;
         return;
+      } else {
+        pinger_write_ping(pinger);
       }
     }
   }
+
+  buf_free(buf);
 }
 
 
-static void pinger_on_connect(uv_req_t *req, int status) {
+static void pinger_connect_cb(uv_req_t *req, int status) {
   pinger_t *pinger = (pinger_t*)req->handle->data;
 
   ASSERT(status == 0);
 
   pinger_write_ping(pinger);
 
-  uv_read_start(req->handle, pinger_read_cb);
+  if (uv_read_start(req->handle, pinger_read_cb)) {
+    FATAL("uv_read_start failed");
+  }
 }
 
 
 static void pinger_new() {
   int r;
+  struct sockaddr_in client_addr = uv_ip4_addr("0.0.0.0", 0);
   struct sockaddr_in server_addr = uv_ip4_addr("127.0.0.1", TEST_PORT);
   pinger_t *pinger;
 
@@ -144,28 +181,22 @@ static void pinger_new() {
   pinger->pongs = 0;
 
   /* Try to connec to the server and do NUM_PINGS ping-pongs. */
-  r = uv_tcp_init(&pinger->handle, pinger_on_close, (void*)pinger);
+  r = uv_tcp_init(&pinger->handle, pinger_close_cb, (void*)pinger);
   ASSERT(!r);
 
   /* We are never doing multiple reads/connects at a time anyway. */
   /* so these handles can be pre-initialized. */
-  uv_req_init(&pinger->connect_req, &pinger->handle, pinger_on_connect);
+  uv_req_init(&pinger->connect_req, &pinger->handle, pinger_connect_cb);
 
+  uv_bind(&pinger->handle, (struct sockaddr*)&client_addr);
   r = uv_connect(&pinger->connect_req, (struct sockaddr*)&server_addr);
   ASSERT(!r);
 }
 
 
-static uv_buf_t alloc_cb(uv_handle_t* handle, size_t size) {
-  uv_buf_t buf;
-  buf.base = (char*)malloc(size);
-  buf.len = size;
-  return buf;
-}
-
-
-TEST_IMPL(ping_pong) {
-  uv_init(alloc_cb);
+BENCHMARK_IMPL(ping_pongs) {
+  uv_init(buf_alloc);
+  start_time = uv_now();
 
   pinger_new();
   uv_run();

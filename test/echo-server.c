@@ -1,101 +1,146 @@
-#include "../oio.h"
-#include "test.h"
+/* Copyright Joyent, Inc. and other Node contributors. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
+
+#include "../uv.h"
+#include "task.h"
 #include <stdio.h>
 #include <stdlib.h>
 
-#define BUFSIZE 1024
 
 typedef struct {
-  oio_handle handle;
-  oio_req req;
-  oio_buf buf;
-  char read_buffer[BUFSIZE];
-} peer_t;
-
-oio_handle server;
-
-void after_write(oio_req* req);
-void after_read(oio_req* req, size_t nread);
-void try_read(peer_t* peer);
-void on_close(oio_handle* peer, oio_err err);
-void on_accept(oio_handle* handle);
+  uv_req_t req;
+  uv_buf_t buf;
+} write_req_t;
 
 
-void after_write(oio_req* req) {
-  peer_t* peer = (peer_t*) req->data;
-  try_read(peer);
+static uv_handle_t server;
+
+
+static void after_write(uv_req_t* req, int status);
+static void after_read(uv_handle_t* handle, int nread, uv_buf_t buf);
+static void on_close(uv_handle_t* peer, int status);
+static void on_accept(uv_handle_t* handle);
+
+
+static void after_write(uv_req_t* req, int status) {
+  write_req_t* wr;
+
+  if (status) {
+    uv_err_t err = uv_last_error();
+    fprintf(stderr, "uv_write error: %s\n", uv_strerror(err));
+    ASSERT(0);
+  }
+
+  wr = (write_req_t*) req;
+
+  /* Free the read/write buffer and the request */
+  free(wr->buf.base);
+  free(wr);
 }
 
 
-void after_read(oio_req* req, size_t nread) {
-  peer_t* peer;
+static void after_shutdown(uv_req_t* req, int status) {
+  free(req);
+}
+
+
+static void after_read(uv_handle_t* handle, int nread, uv_buf_t buf) {
+  write_req_t *wr;
+  uv_req_t* req;
+
+  if (nread < 0) {
+    /* Error or EOF */
+    ASSERT (uv_last_error().code == UV_EOF);
+
+    if (buf.base) {
+      free(buf.base);
+    }
+
+    req = (uv_req_t*) malloc(sizeof *req);
+    uv_req_init(req, handle, after_shutdown);
+    uv_shutdown(req);
+
+    return;
+  }
 
   if (nread == 0) {
-    oio_close(req->handle);
-  } else {
-    peer = (peer_t*) req->data;
-    peer->buf.len = nread;
-    oio_req_init(&peer->req, &peer->handle, after_write);
-    peer->req.data = peer;
-    if (oio_write(&peer->req, &peer->buf, 1))
-      FATAL(oio_write failed)
+    /* Everything OK, but nothing read. */
+    free(buf.base);
+    return;
+  }
+
+  wr = (write_req_t*) malloc(sizeof *wr);
+
+  uv_req_init(&wr->req, handle, after_write);
+  wr->buf.base = buf.base;
+  wr->buf.len = nread;
+  if (uv_write(&wr->req, &wr->buf, 1)) {
+    FATAL("uv_write failed");
   }
 }
 
 
-void try_read(peer_t* peer) {
-  peer->buf.len = BUFSIZE;
-  oio_req_init(&peer->req, &peer->handle, after_read);
-  peer->req.data = peer;
-  if (oio_read(&peer->req, &peer->buf, 1))
-    FATAL(oio_read failed)
-}
-
-
-void on_close(oio_handle* peer, oio_err err) {
-  if (err) {
+static void on_close(uv_handle_t* peer, int status) {
+  if (status != 0) {
     fprintf(stdout, "Socket error\n");
   }
 }
 
 
-void on_accept(oio_handle* server) {
-  peer_t* p = (peer_t*)malloc(sizeof(peer_t));
+static void on_accept(uv_handle_t* server) {
+  uv_handle_t* handle = (uv_handle_t*) malloc(sizeof *handle);
 
-  if (oio_tcp_handle_accept(server, &p->handle, on_close, (void*)p))
-    FATAL(oio_tcp_handle_accept failed)
+  if (uv_accept(server, handle, on_close, NULL)) {
+    FATAL("uv_accept failed");
+  }
 
-  p->buf.base = (char*)&p->read_buffer;
-
-  try_read(p);
+  uv_read_start(handle, after_read);
 }
 
 
-void on_server_close(oio_handle* handle, oio_err err) {
+static void on_server_close(uv_handle_t* handle, int status) {
   ASSERT(handle == &server);
-  ASSERT(!err)
+  ASSERT(status == 0);
 }
 
 
-int echo_start(int port) {
-  struct sockaddr_in addr = oio_ip4_addr("0.0.0.0", port);
+static int echo_start(int port) {
+  struct sockaddr_in addr = uv_ip4_addr("0.0.0.0", port);
   int r;
 
-  r = oio_tcp_handle_init(&server, on_server_close, NULL);
+  r = uv_tcp_init(&server, on_server_close, NULL);
   if (r) {
     /* TODO: Error codes */
     fprintf(stderr, "Socket creation error\n");
     return 1;
   }
 
-  r = oio_bind(&server, (struct sockaddr*) &addr);
+  r = uv_bind(&server, (struct sockaddr*) &addr);
   if (r) {
     /* TODO: Error codes */
     fprintf(stderr, "Bind error\n");
     return 1;
   }
 
-  r = oio_listen(&server, 128, on_accept);
+  r = uv_listen(&server, 128, on_accept);
   if (r) {
     /* TODO: Error codes */
     fprintf(stderr, "Listen error\n");
@@ -106,17 +151,25 @@ int echo_start(int port) {
 }
 
 
-int echo_stop() {
-  return oio_close(&server);
+static int echo_stop() {
+  return uv_close(&server);
 }
 
 
-TEST_IMPL(echo_server) {
-  oio_init();
+static uv_buf_t echo_alloc(uv_handle_t* handle, size_t suggested_size) {
+  uv_buf_t buf;
+  buf.base = (char*) malloc(suggested_size);
+  buf.len = suggested_size;
+  return buf;
+}
+
+
+HELPER_IMPL(echo_server) {
+  uv_init(echo_alloc);
   if (echo_start(TEST_PORT))
     return 1;
 
   fprintf(stderr, "Listening!\n");
-  oio_run();
+  uv_run();
   return 0;
 }

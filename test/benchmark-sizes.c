@@ -20,10 +20,11 @@
  */
 
 #include "task.h"
+#include "../uv.h"
 
 
-TEST_IMPL(fail_always) {
-  /* This test always fails. It is used to test the test runner. */
-  FATAL("Yes, it always fails");
-  return 2;
+BENCHMARK_IMPL(sizes) {
+  LOGF("uv_handle_t: %lu bytes\n", sizeof(uv_handle_t));
+  LOGF("uv_req_t: %lu bytes\n", sizeof(uv_req_t));
+  return 0;
 }

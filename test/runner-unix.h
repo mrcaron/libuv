@@ -19,11 +19,18 @@
  * IN THE SOFTWARE.
  */
 
-#include "task.h"
+#ifndef TEST_RUNNER_UNIX_H
+#define TEST_RUNNER_UNIX_H
 
+#include <sys/types.h>
+#include <stdio.h> /* FILE */
 
-TEST_IMPL(fail_always) {
-  /* This test always fails. It is used to test the test runner. */
-  FATAL("Yes, it always fails");
-  return 2;
-}
+typedef struct {
+  FILE* stdout_file;
+  pid_t pid;
+  char* name;
+  int status;
+  int terminated;
+} process_info_t;
+
+#endif  /* TEST_RUNNER_UNIX_H */

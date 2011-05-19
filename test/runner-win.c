@@ -1,10 +1,53 @@
+/* Copyright Joyent, Inc. and other Node contributors. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
 
 #include <io.h>
+#include <malloc.h>
 #include <stdio.h>
+#include <process.h>
 #include <windows.h>
 
-#include "test.h"
-#include "test-runner.h"
+#include "task.h"
+#include "runner.h"
+
+
+/*
+ * Define the stuff that MinGW doesn't have
+ */
+#ifndef GetFileSizeEx
+  WINBASEAPI BOOL WINAPI GetFileSizeEx(HANDLE hFile,
+                                       PLARGE_INTEGER lpFileSize);
+#endif
+
+
+/* Do platform-specific initialization. */
+void platform_init(int argc, char **argv) {
+  /* Disable the "application crashed" popup. */
+  SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX |
+      SEM_NOOPENFILEERRORBOX);
+
+  /* Disable stdio output buffering. */
+  setvbuf(stdout, NULL, _IONBF, 0);
+  setvbuf(stderr, NULL, _IONBF, 0);
+}
 
 
 int process_start(char *name, process_info_t *p) {
@@ -19,7 +62,7 @@ int process_start(char *name, process_info_t *p) {
 
   if (GetTempPathW(sizeof(path) / sizeof(WCHAR), (WCHAR*)&path) == 0)
     goto error;
-  if (GetTempFileNameW((WCHAR*)&path, L"oio", 0, (WCHAR*)&filename) == 0)
+  if (GetTempFileNameW((WCHAR*)&path, L"uv", 0, (WCHAR*)&filename) == 0)
     goto error;
 
   file = CreateFileW((WCHAR*)filename,
@@ -52,12 +95,11 @@ int process_start(char *name, process_info_t *p) {
   if (result == 0 || result == sizeof(image))
     goto error;
 
-  if (_snwprintf_s((wchar_t*)&args,
-                   sizeof(args) / sizeof(wchar_t),
-                   _TRUNCATE,
-                   L"\"%s\" %S",
-                   image,
-                   name) < 0)
+  if (_snwprintf((wchar_t*)&args,
+                 sizeof(args) / sizeof(wchar_t),
+                 L"\"%s\" %S",
+                 image,
+                 name) < 0)
     goto error;
 
   memset((void*)&si, 0, sizeof(si));
@@ -104,7 +146,7 @@ int process_wait(process_info_t *vec, int n, int timeout) {
   if (n == 0)
     return 0;
 
-  ASSERT(n <= MAXIMUM_WAIT_OBJECTS)
+  ASSERT(n <= MAXIMUM_WAIT_OBJECTS);
 
   for (i = 0; i < n; i++)
     handles[i] = vec[i].process;
@@ -181,12 +223,13 @@ void process_cleanup(process_info_t *p) {
 }
 
 
-int rewind_cursor() {
+static int clear_line() {
   HANDLE handle;
   CONSOLE_SCREEN_BUFFER_INFO info;
   COORD coord;
+  DWORD written;
 
-  handle = (HANDLE)_get_osfhandle(fileno(stdout));
+  handle = (HANDLE)_get_osfhandle(fileno(stderr));
   if (handle == INVALID_HANDLE_VALUE)
     return -1;
 
@@ -197,11 +240,90 @@ int rewind_cursor() {
   if (coord.Y <= 0)
     return -1;
 
-  coord.Y--;
   coord.X = 0;
 
   if (!SetConsoleCursorPosition(handle, coord))
     return -1;
 
+  if (!FillConsoleOutputCharacterW(handle, 0x20, info.dwSize.X, coord, &written))
+    return -1;
+
   return 0;
+}
+
+
+void rewind_cursor() {
+  if (clear_line() == -1) {
+    /* If clear_line fails (stdout is not a console), print a newline. */
+    fprintf(stderr, "\n");
+  }
+}
+
+
+typedef struct {
+  void (*entry)(void* arg);
+  void* arg;
+} thread_info_t;
+
+
+static unsigned __stdcall create_thread_helper(void* info) {
+  /* Copy thread info locally, then free it */
+  void (*entry)(void* arg) = ((thread_info_t*) info)->entry;
+  void* arg = ((thread_info_t*) info)->arg;
+
+  free(info);
+
+  /* Run the actual thread proc */
+  entry(arg);
+
+  /* Finalize */
+  _endthreadex(0);
+  return 0;
+}
+
+
+/* Create a thread. Returns the thread identifier, or 0 on failure. */
+uintptr_t uv_create_thread(void (*entry)(void* arg), void* arg) {
+  uintptr_t result;
+  thread_info_t* info;
+
+  info = (thread_info_t*) malloc(sizeof *info);
+  if (info == NULL) {
+    return 0;
+  }
+
+  info->entry = entry;
+  info->arg = arg;
+
+  result = _beginthreadex(NULL,
+                          0,
+                          &create_thread_helper,
+                          (void*) info,
+                          0,
+                          NULL);
+
+  if (result == 0) {
+    free(info);
+    return 0;
+  }
+
+  return result;
+}
+
+
+/* Wait for a thread to terminate. Should return 0 if the thread ended, -1 on
+ * error.
+ */
+int uv_wait_thread(uintptr_t thread_id) {
+  if (WaitForSingleObject((HANDLE)thread_id, INFINITE) != WAIT_OBJECT_0) {
+    return -1;
+  }
+
+  return 0;
+}
+
+
+/* Pause the calling thread for a number of milliseconds. */
+void uv_sleep(int msec) {
+  Sleep(msec);
 }
